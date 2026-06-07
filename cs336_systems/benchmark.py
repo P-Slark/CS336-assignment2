@@ -17,6 +17,8 @@ from contextlib import nullcontext
 
 import torch
 import torch.cuda.nvtx as nvtx
+from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 import cs336_basics.model
 from cs336_basics.model import BasicsTransformerLM
@@ -46,6 +48,32 @@ def sync(device: torch.device) -> None:
     """Block until all queued CUDA work is done; no-op on CPU/MPS."""
     if device.type == "cuda":
         torch.cuda.synchronize()
+
+
+class _CheckpointedSegment(nn.Module):
+    """Runs a group of consecutive TransformerBlocks under one checkpoint() call,
+    so their internal residuals are dropped in forward and recomputed in backward."""
+
+    def __init__(self, blocks):
+        super().__init__()
+        self.blocks = nn.ModuleList(blocks)
+
+    def forward(self, x):
+        def run(x):
+            for b in self.blocks:
+                x = b(x)
+            return x
+
+        return checkpoint(run, x, use_reentrant=False)
+
+
+def apply_gradient_checkpointing(model: BasicsTransformerLM, segment_size: int) -> None:
+    """Replace model.layers with checkpointed segments of `segment_size` blocks each
+    (segment_size=1 → checkpoint every block). Reparents the same blocks, so params
+    are unchanged. The model's forward still iterates model.layers, now hitting checkpoints."""
+    layers = list(model.layers)
+    groups = [layers[i:i + segment_size] for i in range(0, len(layers), segment_size)]
+    model.layers = nn.ModuleList(_CheckpointedSegment(g) for g in groups)
 
 
 def build_model(args, device: torch.device, dtype: torch.dtype) -> BasicsTransformerLM:
@@ -101,6 +129,8 @@ def benchmark(args) -> None:
         cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
 
     model = build_model(args, device, dtype)
+    if args.gradient_checkpointing:
+        apply_gradient_checkpointing(model, args.checkpoint_segment)
     optimizer = AdamW(model.parameters(), lr=1e-4)
 
     # Mixed-precision autocast context (no-op nullcontext when --autocast is off).
@@ -145,9 +175,10 @@ def benchmark(args) -> None:
 
     n_params = sum(p.numel() for p in model.parameters())
     amp_str = f"autocast:{args.autocast_dtype}" if args.autocast else "autocast:off"
+    ckpt_str = f"ckpt:seg{args.checkpoint_segment}" if args.gradient_checkpointing else "ckpt:off"
     print(
         f"size={args.size or 'custom'} mode={args.mode} device={device.type} dtype={args.dtype} "
-        f"{amp_str} ctx={args.context_length} batch={args.batch_size} params={n_params/1e6:.1f}M "
+        f"{amp_str} {ckpt_str} ctx={args.context_length} batch={args.batch_size} params={n_params/1e6:.1f}M "
         f"warmup={args.warmup} steps={args.steps}"
     )
     print(f"  mean={mean*1e3:.2f} ms  std={std*1e3:.2f} ms  ({mean*1e3/args.context_length:.4f} ms/token-step)")
@@ -186,6 +217,10 @@ def parse_args() -> argparse.Namespace:
                    help="record a CUDA memory snapshot over the measured steps (§2.1.6)")
     p.add_argument("--memory-snapshot", default="memory_snapshot.pickle",
                    help="output path for the memory snapshot pickle")
+    p.add_argument("--gradient-checkpointing", action="store_true",
+                   help="wrap TransformerBlocks in checkpoint() to trade compute for activation memory (§3)")
+    p.add_argument("--checkpoint-segment", type=int, default=1,
+                   help="blocks per checkpoint segment (1 = checkpoint every block)")
 
     args = p.parse_args()
     if args.size:  # preset fills in architecture, leaving other flags untouched
