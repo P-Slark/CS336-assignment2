@@ -326,13 +326,77 @@ fixed bias, same each step; *linear*, not compounding → the harmless +0.002. *
 
 ---
 
+## 7. Memory profiling (§2.1.6, Problem `memory_profiling`, 4 pts)
+
+**Code:** added `--memory-profile` / `--memory-snapshot` to `benchmark.py`. After warm-up it calls
+`torch.cuda.memory._record_memory_history(max_entries=1e6)`, runs the measured steps, dumps a pickle via
+`_dump_snapshot(...)`, and stops recording. Every CUDA run now also prints `peak_memory` via
+`torch.cuda.max_memory_allocated()` (answers b/c without the GUI). View pickles at pytorch.org/memory_viz.
+
+### Hardware constraint: xl does NOT fit on a 32 GB RTX 5090
+
+A full fp32 training step keeps **4 parameter-sized copies** (params + grads + AdamW m + v = params×16 B):
+
+| Model | params×16 B (param+grad+m+v) | Fits 32 GB full step? |
+|-------|------------------------------|------------------------|
+| xl (~3.4B) | **~54 GB** | ❌ never (optimizer state alone exceeds VRAM) |
+| large (969M) | ~15.5 GB + ~24 GB attn @ctx2048 | ❌ OOM at ctx 2048 |
+| medium (423M) | ~6.5 GB | ✅ fits both contexts |
+
+Also, **attention activations scale as seq²**: the `(batch, heads, seq, seq)` scores + softmax tensors are
+saved for backward, so going ctx 128→2048 grows them 256×. At ctx 2048 even batch 1 is needed.
+→ We **substituted `medium` (batch 1)** for the profiling and document xl/large as OOM (the OOM itself is
+the insight that motivates §4 FlashAttention and §6/§7 sharding).
+
+### (b) Peak memory (medium, batch 1)
+
+| Context | Forward | Full step |
+|---------|---------|-----------|
+| 128  | 2040 MiB (~2.0 GB)  | 6686 MiB (~6.5 GB)  |
+| 2048 | 20098 MiB (~19.6 GB) | 24027 MiB (~23.5 GB) |
+
+> **(b)** At ctx 128 forward needs ~2.0 GB and a full step ~6.5 GB (~3.3×): the full step adds gradients +
+> AdamW's two moment buffers (3 extra param-sized fp32 copies), and activations are negligible, so memory is
+> **state-bound**. At ctx 2048 forward already needs ~19.6 GB and full ~23.5 GB: the seq²-scaling attention
+> activations now dominate (**activation-bound**), so the forward→full gap shrinks to the fixed ~4 GB
+> gradient+optimizer cost.
+
+### (c) Mixed precision (full step)
+
+| Context | fp32 | bf16 | saving |
+|---------|------|------|--------|
+| 128  | 6686 MiB | 6684 MiB | ~0% |
+| 2048 | 24027 MiB | 19664 MiB | ~18% (4.4 GB) |
+
+> **(c)** BF16 autocast barely changes peak memory at short context (~0%) but saves ~18% at long context.
+> Autocast keeps only *activations* in bf16; params, grads, and optimizer state stay fp32. Short context is
+> state-bound (nothing to shrink); long context is activation-bound (halving activations helps, but not 2×
+> since the fp32 state is untouched). **Mixed precision is a compute optimization, not primarily a memory one.**
+
+### (d) Residual-stream activation tensor (xl, fp32)
+
+`(batch, seq, d_model)` × 4 B, d_model=2560, batch 4: **ctx 128 → 5.0 MiB, ctx 2048 → 80.0 MiB** (linear in seq).
+
+### (a)/(e) Timelines (from memory_viz — screenshots to capture)
+
+- **Forward:** single staircase ramp as each layer allocates activations, then a drop.
+- **Full step:** ramps through forward to a **peak at the forward→backward boundary** (all activations live),
+  then a declining sawtooth through backward (activations freed as grads emitted), then a smaller optimizer
+  bump — the phases are visually distinguishable.
+- **(e)** lower the "Detail" slider to ~10% to surface the largest allocations + their stack traces.
+- *(TODO: drop the two `mem_medium_*` pickles into pytorch.org/memory_viz and save the two screenshots.)*
+
+---
+
 ## Status / next steps
 
 - [x] §2.1.3 `benchmarking_script` (4 pts) — script + (b)/(c) answers.
 - [x] §2.1.4 `nsys_profile` (5 pts) — NVTX annotations, small/512 profiled, all five answers.
       (Optional: extra size/context combos for full coverage.)
 - [x] §2.1.5 `mixed_precision_accumulation` (1) + `benchmarking_mixed_precision` (2) — all answered.
-- [ ] §2.1.6 `memory_profiling` (4 pts) — add `torch.cuda.memory._record_memory_history` snapshot
-      option, profile xl at ctx 128 / 2048, view in pytorch.org/memory_viz.
+- [x] §2.1.6 `memory_profiling` (4 pts) — code added, medium/batch-1 profiled (xl/large OOM on 32 GB,
+      documented), (b)/(c)/(d) answered. TODO: capture the two memory_viz timeline screenshots for (a)/(e).
 - [ ] §4 FlashAttention-2 (Triton) — biggest single chunk (forward 15 pts, backward 5 pts).
 - [ ] §5 DDP, §6 optimizer state sharding, §7 FSDP, §8 parallelism math, §9 leaderboard.
+
+**§2.1 Profiling & Benchmarking complete: 16/16 points drafted** (pending the two memory screenshots).
