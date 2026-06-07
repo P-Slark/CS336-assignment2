@@ -361,17 +361,21 @@ the insight that motivates §4 FlashAttention and §6/§7 sharding).
 > activations now dominate (**activation-bound**), so the forward→full gap shrinks to the fixed ~4 GB
 > gradient+optimizer cost.
 
-### (c) Mixed precision (full step)
+### (c) Mixed precision (forward + full step)
 
-| Context | fp32 | bf16 | saving |
-|---------|------|------|--------|
-| 128  | 6686 MiB | 6684 MiB | ~0% |
-| 2048 | 24027 MiB | 19664 MiB | ~18% (4.4 GB) |
+| Context | Mode | fp32 | bf16 | Δ |
+|---------|------|------|------|---|
+| 128  | forward | 2040 MiB | 2676 MiB | **+636 (+31%)** |
+| 128  | full    | 6686 MiB | 6684 MiB | ~0% |
+| 2048 | forward | 20098 MiB | 15544 MiB | −4554 (−23%) |
+| 2048 | full    | 24027 MiB | 19664 MiB | −4363 (−18%) |
 
-> **(c)** BF16 autocast barely changes peak memory at short context (~0%) but saves ~18% at long context.
-> Autocast keeps only *activations* in bf16; params, grads, and optimizer state stay fp32. Short context is
-> state-bound (nothing to shrink); long context is activation-bound (halving activations helps, but not 2×
-> since the fp32 state is untouched). **Mixed precision is a compute optimization, not primarily a memory one.**
+> **(c)** Mixed precision does **not** significantly reduce memory — at short context it can *increase* it
+> (forward ctx 128: +31%). Autocast keeps params, grads, and optimizer state in fp32 and stores only
+> *activations* in bf16, while *adding* cached bf16 copies of the weights for the matmuls. When state
+> dominates (short context) those extra weight copies outweigh the tiny activation savings; only when
+> activations dominate (long context) does bf16 give a real ~18–23% reduction. **BF16 autocast is a
+> compute/speed optimization, not primarily a memory-saving one.**
 
 ### (d) Residual-stream activation tensor (xl, fp32)
 
