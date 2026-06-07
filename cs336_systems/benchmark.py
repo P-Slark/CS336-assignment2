@@ -120,6 +120,14 @@ def benchmark(args) -> None:
             run_step(model, optimizer, x, y, args.mode, amp_ctx)
         sync(device)
 
+    # Measure peak memory only over the steps we care about (post-warmup).
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+    # Memory snapshot recording starts AFTER warmup so the timeline shows steady-state
+    # allocations, not one-time warmup churn (§2.1.6).
+    if args.memory_profile and device.type == "cuda":
+        torch.cuda.memory._record_memory_history(max_entries=1_000_000)
+
     timings: list[float] = []
     for i in range(args.steps):
         with nvtx_range(f"measured_step_{i}"):
@@ -127,6 +135,10 @@ def benchmark(args) -> None:
             run_step(model, optimizer, x, y, args.mode, amp_ctx)
             sync(device)  # ensure GPU work for THIS step is finished before stopping the clock
             timings.append(timeit.default_timer() - start)
+
+    if args.memory_profile and device.type == "cuda":
+        torch.cuda.memory._dump_snapshot(args.memory_snapshot)
+        torch.cuda.memory._record_memory_history(enabled=None)
 
     mean = statistics.mean(timings)
     std = statistics.stdev(timings) if len(timings) > 1 else 0.0
@@ -139,6 +151,11 @@ def benchmark(args) -> None:
         f"warmup={args.warmup} steps={args.steps}"
     )
     print(f"  mean={mean*1e3:.2f} ms  std={std*1e3:.2f} ms  ({mean*1e3/args.context_length:.4f} ms/token-step)")
+    if device.type == "cuda":
+        peak_mib = torch.cuda.max_memory_allocated() / 1024**2
+        print(f"  peak_memory={peak_mib:.1f} MiB")
+        if args.memory_profile:
+            print(f"  memory snapshot written to {args.memory_snapshot}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -165,6 +182,10 @@ def parse_args() -> argparse.Namespace:
                    help="run forward + loss under torch.autocast mixed precision")
     p.add_argument("--autocast-dtype", default="bfloat16",
                    help="autocast dtype when --autocast is set (default: bfloat16)")
+    p.add_argument("--memory-profile", action="store_true",
+                   help="record a CUDA memory snapshot over the measured steps (§2.1.6)")
+    p.add_argument("--memory-snapshot", default="memory_snapshot.pickle",
+                   help="output path for the memory snapshot pickle")
 
     args = p.parse_args()
     if args.size:  # preset fills in architecture, leaving other flags untouched
