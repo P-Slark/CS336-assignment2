@@ -403,18 +403,30 @@ accumulate, on a higher persistent floor (params + AdamW optimizer state).
 
 ### (e) Largest allocations at ~10% Detail
 
-At Detail ~10% ([Artifacts/mem_large_128_full_10.png](Artifacts/mem_large_128_full_10.png), 5,230 of 30,212
-allocations shown) the plotted memory splits into a **persistent striped base (~5.6 GiB** = parameters +
-gradients + AdamW optimizer state) and a **large blue wedge (up to ~8 GiB at peak)** that grows each forward
-and frees each backward — the **activations saved for the backward pass** (the "residuals").
+At Detail ~10% the tool hides the thousands of tiny tensors and keeps only the biggest *individual*
+allocations ([Artifacts/mem_large_128_full_10.png](Artifacts/mem_large_128_full_10.png) shows the full-step
+view, 5,230 of 30,212 shown; for (e) the *forward* snapshot
+[Artifacts/mem_large_128_fwd.png](Artifacts/mem_large_128_fwd.png) is the right one). **Note the blue
+"wedge" is the *sum* of many small activations, not one allocation** — so the largest individual blocks are
+elsewhere.
 
-> **(e)** With Detail reduced to ~10%, only the largest allocations remain: a persistent ~5.6 GiB striped
-> base (params + grads + optimizer state) and a breathing blue wedge of per-step activations saved for
-> backward. The largest *individual* allocations are on the order of tens of MiB — the embedding / LM-head
-> weights (vocab × d_model × 4 B = 10000 × 1280 × 4 ≈ 51 MiB) and the per-block attention/SwiGLU activation
-> tensors — whose stack traces lead into `TransformerBlock.forward` (`CausalMultiHeadSelfAttention` and
-> `SwiGLU`). The breathing wedge confirms these per-block activations dominate transient memory and are the
-> tensors freed-then-replaced-by-gradients during backward.
+Largest individual tensors (large model: d_model=1280, d_ff=5120, vocab=10000):
+
+| At ctx 128, batch 1 | Shape | Size |
+|---------------------|-------|------|
+| Embedding weight (param) | 10000 × 1280 | **48.8 MiB** |
+| LM-head weight (param)   | 1280 × 10000 | **48.8 MiB** |
+| FFN w1/w2/w3 (param)     | 1280 × 5120  | 25 MiB each |
+| *largest activation* (logits) | 1×128×10000 | only 4.9 MiB |
+
+> **(e)** Which allocation is largest depends on context length. In the short-context forward snapshot
+> (ctx 128, batch 1) the largest blocks are ~49 MiB — the embedding and LM-head **weight matrices**
+> (vocab × d_model), then the ~25 MiB SwiGLU FFN weights; their stack traces point to the model's parameter
+> tensors (`nn.Embedding`/`nn.Linear`), because every *activation* at this size is <5 MiB. In the
+> long-context snapshot (ctx 2048) the largest single allocation flips to the attention score/probability
+> tensor `(batch, heads, seq, seq)` — e.g. 1×20×2048×2048×4 B ≈ **320 MiB**, allocated inside
+> `scaled_dot_product_attention` (a saved-for-backward activation, i.e. an O(seq²) "residual"). So: weight
+> matrices dominate at short context, the quadratic attention tensor dominates at long context.
 
 ---
 
