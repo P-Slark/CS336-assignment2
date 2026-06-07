@@ -12,7 +12,7 @@ Examples:
 
 import argparse
 import statistics
-import time
+import timeit
 
 import torch
 
@@ -52,13 +52,16 @@ def build_model(args, device: torch.device, dtype: torch.dtype) -> BasicsTransfo
 
 
 def run_step(model, optimizer, x, y, mode: str) -> None:
-    """One step of the requested kind. Caller handles timing/synchronization."""
+    """One step of the requested kind. Caller handles timing/synchronization.
+
+    Forward is run WITH grad tracking in every mode (i.e. no torch.no_grad),
+    so 'forward' and 'forward_backward' measure the same forward, and
+    backward time can be derived as (forward_backward - forward).
+    """
+    logits = model(x)
     if mode == "forward":
-        with torch.no_grad():
-            model(x)
         return
 
-    logits = model(x)
     loss = cross_entropy(logits, y)
     loss.backward()
 
@@ -86,10 +89,10 @@ def benchmark(args) -> None:
 
     timings: list[float] = []
     for _ in range(args.steps):
-        start = time.perf_counter()
+        start = timeit.default_timer()
         run_step(model, optimizer, x, y, args.mode)
         sync(device)  # ensure GPU work for THIS step is finished before stopping the clock
-        timings.append(time.perf_counter() - start)
+        timings.append(timeit.default_timer() - start)
 
     mean = statistics.mean(timings)
     std = statistics.stdev(timings) if len(timings) > 1 else 0.0
