@@ -13,12 +13,22 @@ Examples:
 import argparse
 import statistics
 import timeit
+from contextlib import nullcontext
 
 import torch
+import torch.cuda.nvtx as nvtx
 
+import cs336_basics.model
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.nn_utils import cross_entropy
 from cs336_basics.optimizer import AdamW
+
+# NVTX is only available in CUDA builds; make ranges a no-op elsewhere (e.g. CPU/Mac).
+_NVTX_ENABLED = torch.cuda.is_available()
+
+
+def nvtx_range(msg: str):
+    return nvtx.range(msg) if _NVTX_ENABLED else nullcontext()
 
 # Model presets from handout Table 1 (§2.1.2): d_model, d_ff, num_layers, num_heads.
 MODEL_SIZES = {
@@ -58,15 +68,18 @@ def run_step(model, optimizer, x, y, mode: str) -> None:
     so 'forward' and 'forward_backward' measure the same forward, and
     backward time can be derived as (forward_backward - forward).
     """
-    logits = model(x)
+    with nvtx_range("forward"):
+        logits = model(x)
     if mode == "forward":
         return
 
-    loss = cross_entropy(logits, y)
-    loss.backward()
+    with nvtx_range("backward"):
+        loss = cross_entropy(logits, y)
+        loss.backward()
 
     if mode == "full":
-        optimizer.step()
+        with nvtx_range("optimizer"):
+            optimizer.step()
     # Clear grads either way so backward steps don't accumulate across iterations.
     optimizer.zero_grad(set_to_none=True)
 
@@ -74,6 +87,13 @@ def run_step(model, optimizer, x, y, mode: str) -> None:
 def benchmark(args) -> None:
     device = torch.device(args.device)
     dtype = getattr(torch, args.dtype)
+
+    if args.nvtx_attention:
+        # Swap in the NVTX-annotated attention so the profiler can break self-attention
+        # into scores / softmax / final-matmul ranges (§2.1.4).
+        from cs336_systems.nsys_annotations import annotated_scaled_dot_product_attention
+
+        cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
 
     model = build_model(args, device, dtype)
     optimizer = AdamW(model.parameters(), lr=1e-4)
@@ -83,16 +103,19 @@ def benchmark(args) -> None:
     y = torch.randint(0, args.vocab_size, (args.batch_size, args.context_length), device=device)
 
     # Warm-up: lets cuDNN/cuBLAS autotune, JIT/compile caches fill, allocator settle.
-    for _ in range(args.warmup):
-        run_step(model, optimizer, x, y, args.mode)
-    sync(device)
+    # Wrapped in its own NVTX range so it can be filtered OUT of the profile.
+    with nvtx_range("warmup"):
+        for _ in range(args.warmup):
+            run_step(model, optimizer, x, y, args.mode)
+        sync(device)
 
     timings: list[float] = []
-    for _ in range(args.steps):
-        start = timeit.default_timer()
-        run_step(model, optimizer, x, y, args.mode)
-        sync(device)  # ensure GPU work for THIS step is finished before stopping the clock
-        timings.append(timeit.default_timer() - start)
+    for i in range(args.steps):
+        with nvtx_range(f"measured_step_{i}"):
+            start = timeit.default_timer()
+            run_step(model, optimizer, x, y, args.mode)
+            sync(device)  # ensure GPU work for THIS step is finished before stopping the clock
+            timings.append(timeit.default_timer() - start)
 
     mean = statistics.mean(timings)
     std = statistics.stdev(timings) if len(timings) > 1 else 0.0
@@ -124,6 +147,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--steps", type=int, default=10)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--dtype", default="float32")
+    p.add_argument("--nvtx-attention", action="store_true",
+                   help="swap in NVTX-annotated attention (scores/softmax/matmul) for profiling")
 
     args = p.parse_args()
     if args.size:  # preset fills in architecture, leaving other flags untouched
