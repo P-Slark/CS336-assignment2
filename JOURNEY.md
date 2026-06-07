@@ -256,6 +256,40 @@ A float is `±(1.mantissa) × 2^exponent` — exponent bits set **dynamic range*
 > residual +0.002 is just the fixed fp16 quantization of 0.01, not accumulation drift. **Implication:**
 > compute in low precision for speed, but keep reductions / optimizer state / master weights in fp32.
 
+#### Why the error happens (the mechanism)
+
+Float addition = **align exponents → add → round to the representable grid**. To add two numbers with
+different exponents, the hardware shifts the *smaller* number's mantissa right until exponents match;
+bits shifted past the fixed mantissa width are **discarded** (rounded). That discard is the error.
+
+Worked example, `8.0 + 0.01` in fp16 (1 implicit + 10 mantissa bits):
+```
+8.0        = 1.0000000000              × 2^3
+fp16(0.01) = 1.0100011111 × 2^-7  →  shift right 10 bits to exponent 3:
+             0.0000000001|0100011111  × 2^3
+                         ↑ bits right of the line don't fit in 10 mantissa bits → rounded off
+result     = 1.0000000001 × 2^3 = 8 + 2^-7 = 8.0078125
+```
+So `8.0 + 0.01` adds **0.0078, not 0.0100** — a 0.0022 loss in one add, because 0.01's low bits fell off
+the mantissa.
+
+Why it compounds: the grid spacing (ULP) **doubles every power of two**, so as `s` grows 0.01 spans
+fewer ULPs and rounds harder:
+
+| `s` range | fp16 ULP | 0.01 in ULPs | effect |
+|-----------|----------|--------------|--------|
+| [1, 2)   | 0.00098  | ~10 ULP   | added accurately |
+| [4, 8)   | 0.0039   | ~2.6 ULP  | mild rounding |
+| **[8, 16)** | **0.0078** | **~1.28 ULP** | rounds 1.28→1 ULP, under-adds every step |
+
+Repeated under-rounding near the top compounds to the −0.047 deficit. Limiting case = **total
+absorption**: if `s` ≥ ~40, then 0.01 < ½ ULP, rounds to zero, and `s += 0.01` does *nothing*.
+
+**Two distinct error sources:** (1) **accumulator rounding** — the running sum's coarse grid rounds
+every add; *compounds* → the big fp16 error. (2) **addend quantization** — fp16(0.01)≈0.0100021 is a
+fixed bias, same each step; *linear*, not compounding → the harmless +0.002. **fp32 accumulator fixes
+(1):** near 10 its ULP ≈ 2⁻²⁰ ≈ 1e-6, so 0.01 is ~10,000 ULP wide and nothing important is shifted off.
+
 ### `benchmarking_mixed_precision`
 
 **(a) dtypes under `torch.autocast(dtype=float16)`** for the ToyModel:
