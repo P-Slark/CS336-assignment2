@@ -222,11 +222,83 @@ entirely elementwise (per-param moment/variance updates: `BinaryFunctor` 6.5%, `
 
 ---
 
+## 6. Mixed precision (§2.1.5: `mixed_precision_accumulation` 1 pt, `benchmarking_mixed_precision` 2 pts)
+
+### Float-format background (why low precision loses accuracy)
+
+A float is `±(1.mantissa) × 2^exponent` — exponent bits set **dynamic range**, mantissa bits set
+**precision**.
+
+| Format | Sign/Exp/Mantissa | Dynamic range | Precision |
+|--------|-------------------|---------------|-----------|
+| fp32   | 1 / 8 / 23        | ~1e-38 … 3.4e38 | ~7 digits |
+| fp16   | 1 / 5 / 10        | ~6e-8 … 65504   | ~3–4 digits |
+| bf16   | 1 / 8 / 7         | ~1e-38 … 3e38 (= fp32!) | ~2–3 digits |
+
+- A value is exact only if it's `integer × 2^k`. **10 = 1.010₂×2³ is exact**; **0.01 = 1/100 has
+  factor 25 (not a power of 2) → non-terminating binary fraction → never exact** in any binary float.
+- **bf16 keeps fp32's range but has the worst precision** — key reason it's preferred for training
+  (rarely overflows) over fp16.
+
+### `mixed_precision_accumulation` — accumulating 1000 × 0.01 (true = 10.0)
+
+| Accumulator | Addend | Result | Error source |
+|-------------|--------|--------|--------------|
+| fp32 | fp32 | 10.0001 | negligible |
+| **fp16** | fp16 | **9.9531** | **accumulator** — ULP near 10 is ~0.0078 > 0.01, small adds get swallowed |
+| fp32 | fp16 (implicit upcast) | 10.0021 | addend only — fp16(0.01)≈0.0100021, ×1000 |
+| fp32 | fp16 (explicit `.float()`) | 10.0021 | same — PyTorch upcasts fp16→fp32 in `+` either way |
+
+> **Answer:** Pure fp32 gives 10.0001 but pure fp16 gives only 9.9531 (~0.5% error), because once the
+> running sum grows large the fp16 ULP (~0.0078 near 10) exceeds the 0.01 increments and small adds are
+> partially absorbed. Keeping the **accumulator in fp32** fixes it (10.0021) even with fp16 addends —
+> PyTorch type-promotes fp16→fp32 before adding (so explicit `.type(torch.float32)` is identical); the
+> residual +0.002 is just the fixed fp16 quantization of 0.01, not accumulation drift. **Implication:**
+> compute in low precision for speed, but keep reductions / optimizer state / master weights in fp32.
+
+### `benchmarking_mixed_precision`
+
+**(a) dtypes under `torch.autocast(dtype=float16)`** for the ToyModel:
+
+| Component | dtype | Why |
+|-----------|-------|-----|
+| model parameters | **fp32** | autocast casts op inputs, never the stored params |
+| fc1 output (Linear) | **fp16** | matmul is autocast-eligible |
+| ln output (LayerNorm) | **fp32** | normalization/reduction op kept in fp32 |
+| logits (fc2) | **fp16** | linear |
+| loss | **fp32** | softmax/cross-entropy reductions in fp32 |
+| gradients | **fp32** | match fp32 params |
+
+> **(b)** LayerNorm computes mean + variance (sum / sum-of-squares **reductions**) then divides by the
+> standard deviation; those accumulations and the `1/√(var+ε)` step need fp32's range/precision and can
+> overflow/underflow in fp16's narrow range, so autocast keeps LN in fp32. With **BF16** the
+> dynamic-range problem disappears (bf16 shares fp32's exponent range), so the overflow/underflow risk
+> is gone; PyTorch still runs LN in fp32 (bf16's 7-bit mantissa is even less precise, so fp32 reductions
+> still help accuracy), but special-casing it is far less *necessary*.
+
+**(c) Code:** added `--autocast` / `--autocast-dtype` to `benchmark.py`; only forward + loss run under
+`torch.autocast`, backward/optimizer stay outside (PyTorch AMP guidance). Results (fwd+bwd, ctx 512, batch 4):
+
+| Size | FP32 | BF16 | Speedup |
+|------|------|------|---------|
+| small (129M) | 58.99 ms | 66.42 ms | **0.89× (slower)** |
+| medium (423M) | 152.90 ms | 104.83 ms | **1.46×** |
+| large (969M) | 333.44 ms | 173.46 ms | **1.92×** |
+
+> **(c) Answer:** BF16 gives no benefit (a ~11% slowdown) for small but a speedup that grows with size —
+> 1.46× medium, 1.92× large. BF16's win comes from Tensor-Core matmuls; small models are dominated by
+> kernel-launch overhead and memory-bound elementwise/normalization ops (kept fp32), so the autocast
+> casting cost outweighs the tiny matmul savings, whereas large models are matmul-bound and approach ~2×.
+
+---
+
 ## Status / next steps
 
-- [x] §2.1.3 `benchmarking_script` (4 pts) — script written, (b) & (c) answers drafted.
-- [x] §2.1.4 `nsys_profile` (5 pts) — NVTX annotations added, small/512 profiled, all five
-      answers drafted. (Still to do: extra size/context combos for full coverage.)
-- [ ] §2.1.5 mixed precision (`mixed_precision_accumulation`, `benchmarking_mixed_precision`).
+- [x] §2.1.3 `benchmarking_script` (4 pts) — script + (b)/(c) answers.
+- [x] §2.1.4 `nsys_profile` (5 pts) — NVTX annotations, small/512 profiled, all five answers.
+      (Optional: extra size/context combos for full coverage.)
+- [x] §2.1.5 `mixed_precision_accumulation` (1) + `benchmarking_mixed_precision` (2) — all answered.
+- [ ] §2.1.6 `memory_profiling` (4 pts) — add `torch.cuda.memory._record_memory_history` snapshot
+      option, profile xl at ctx 128 / 2048, view in pytorch.org/memory_viz.
 - [ ] §4 FlashAttention-2 (Triton) — biggest single chunk (forward 15 pts, backward 5 pts).
 - [ ] §5 DDP, §6 optimizer state sharding, §7 FSDP, §8 parallelism math, §9 leaderboard.
