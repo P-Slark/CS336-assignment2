@@ -61,20 +61,25 @@ def build_model(args, device: torch.device, dtype: torch.dtype) -> BasicsTransfo
     return model.to(device=device, dtype=dtype)
 
 
-def run_step(model, optimizer, x, y, mode: str) -> None:
+def run_step(model, optimizer, x, y, mode: str, amp_ctx) -> None:
     """One step of the requested kind. Caller handles timing/synchronization.
 
     Forward is run WITH grad tracking in every mode (i.e. no torch.no_grad),
     so 'forward' and 'forward_backward' measure the same forward, and
     backward time can be derived as (forward_backward - forward).
+
+    amp_ctx() yields the autocast context (or a nullcontext when mixed precision
+    is off). Only the forward pass + loss run under autocast; backward/optimizer
+    run outside it, as recommended by PyTorch AMP.
     """
-    with nvtx_range("forward"):
-        logits = model(x)
-    if mode == "forward":
-        return
+    with amp_ctx():
+        with nvtx_range("forward"):
+            logits = model(x)
+        if mode == "forward":
+            return
+        loss = cross_entropy(logits, y)
 
     with nvtx_range("backward"):
-        loss = cross_entropy(logits, y)
         loss.backward()
 
     if mode == "full":
@@ -98,6 +103,12 @@ def benchmark(args) -> None:
     model = build_model(args, device, dtype)
     optimizer = AdamW(model.parameters(), lr=1e-4)
 
+    # Mixed-precision autocast context (no-op nullcontext when --autocast is off).
+    amp_dtype = getattr(torch, args.autocast_dtype)
+
+    def amp_ctx():
+        return torch.autocast(device_type=device.type, dtype=amp_dtype) if args.autocast else nullcontext()
+
     # Random batch of token ids + targets; reused across steps (we measure speed only).
     x = torch.randint(0, args.vocab_size, (args.batch_size, args.context_length), device=device)
     y = torch.randint(0, args.vocab_size, (args.batch_size, args.context_length), device=device)
@@ -106,14 +117,14 @@ def benchmark(args) -> None:
     # Wrapped in its own NVTX range so it can be filtered OUT of the profile.
     with nvtx_range("warmup"):
         for _ in range(args.warmup):
-            run_step(model, optimizer, x, y, args.mode)
+            run_step(model, optimizer, x, y, args.mode, amp_ctx)
         sync(device)
 
     timings: list[float] = []
     for i in range(args.steps):
         with nvtx_range(f"measured_step_{i}"):
             start = timeit.default_timer()
-            run_step(model, optimizer, x, y, args.mode)
+            run_step(model, optimizer, x, y, args.mode, amp_ctx)
             sync(device)  # ensure GPU work for THIS step is finished before stopping the clock
             timings.append(timeit.default_timer() - start)
 
@@ -121,9 +132,10 @@ def benchmark(args) -> None:
     std = statistics.stdev(timings) if len(timings) > 1 else 0.0
 
     n_params = sum(p.numel() for p in model.parameters())
+    amp_str = f"autocast:{args.autocast_dtype}" if args.autocast else "autocast:off"
     print(
         f"size={args.size or 'custom'} mode={args.mode} device={device.type} dtype={args.dtype} "
-        f"ctx={args.context_length} batch={args.batch_size} params={n_params/1e6:.1f}M "
+        f"{amp_str} ctx={args.context_length} batch={args.batch_size} params={n_params/1e6:.1f}M "
         f"warmup={args.warmup} steps={args.steps}"
     )
     print(f"  mean={mean*1e3:.2f} ms  std={std*1e3:.2f} ms  ({mean*1e3/args.context_length:.4f} ms/token-step)")
@@ -149,6 +161,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dtype", default="float32")
     p.add_argument("--nvtx-attention", action="store_true",
                    help="swap in NVTX-annotated attention (scores/softmax/matmul) for profiling")
+    p.add_argument("--autocast", action="store_true",
+                   help="run forward + loss under torch.autocast mixed precision")
+    p.add_argument("--autocast-dtype", default="bfloat16",
+                   help="autocast dtype when --autocast is set (default: bfloat16)")
 
     args = p.parse_args()
     if args.size:  # preset fills in architecture, leaving other flags untouched
