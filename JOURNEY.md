@@ -381,14 +381,40 @@ the insight that motivates §4 FlashAttention and §6/§7 sharding).
 
 `(batch, seq, d_model)` × 4 B, d_model=2560, batch 4: **ctx 128 → 5.0 MiB, ctx 2048 → 80.0 MiB** (linear in seq).
 
-### (a)/(e) Timelines (from memory_viz — screenshots to capture)
+### (a) Timelines (large model, ctx 128, batch 1 — xl/medium substituted; see hardware note)
 
-- **Forward:** single staircase ramp as each layer allocates activations, then a drop.
-- **Full step:** ramps through forward to a **peak at the forward→backward boundary** (all activations live),
-  then a declining sawtooth through backward (activations freed as grads emitted), then a smaller optimizer
-  bump — the phases are visually distinguishable.
-- **(e)** lower the "Detail" slider to ~10% to surface the largest allocations + their stack traces.
-- *(TODO: drop the two `mem_medium_*` pickles into pytorch.org/memory_viz and save the two screenshots.)*
+**Forward-only** ([Artifacts/mem_large_128_fwd.png](Artifacts/mem_large_128_fwd.png)) — three identical
+triangular peaks (one per measured step): each forward ramps from a ~3.7 GiB baseline (persistent
+parameters, 969M × 4 B) up to a ~6.5 GiB peak as activations allocate, then drops back to baseline when the
+autograd graph is released.
+
+**Full training step** ([Artifacts/mem_large_128_full.png](Artifacts/mem_large_128_full.png)) — a taller
+sawtooth peaking at ~13.5 GiB (~2× the forward peak): memory ramps up through forward, peaks at the
+forward→backward boundary, then descends in steps through backward as activations free and gradients
+accumulate, on a higher persistent floor (params + AdamW optimizer state).
+
+> **(a)** The forward-only timeline shows three triangular peaks (one per step): activations climb from a
+> ~3.7 GiB baseline (persistent parameters) to ~6.5 GiB, then free all at once when the graph is released.
+> The full-step timeline is a taller sawtooth peaking at ~13.5 GiB: memory ramps up through forward, peaks
+> at the forward→backward boundary, then descends in steps through backward as activations free and
+> gradients accumulate, sitting on a higher floor of parameters + optimizer state. **Yes, the stages are
+> distinguishable** — the rising edge is forward, the maximum marks the start of backward, the declining
+> staircase is backward.
+
+### (e) Largest allocations at ~10% Detail
+
+At Detail ~10% ([Artifacts/mem_large_128_full_10.png](Artifacts/mem_large_128_full_10.png), 5,230 of 30,212
+allocations shown) the plotted memory splits into a **persistent striped base (~5.6 GiB** = parameters +
+gradients + AdamW optimizer state) and a **large blue wedge (up to ~8 GiB at peak)** that grows each forward
+and frees each backward — the **activations saved for the backward pass** (the "residuals").
+
+> **(e)** With Detail reduced to ~10%, only the largest allocations remain: a persistent ~5.6 GiB striped
+> base (params + grads + optimizer state) and a breathing blue wedge of per-step activations saved for
+> backward. The largest *individual* allocations are on the order of tens of MiB — the embedding / LM-head
+> weights (vocab × d_model × 4 B = 10000 × 1280 × 4 ≈ 51 MiB) and the per-block attention/SwiGLU activation
+> tensors — whose stack traces lead into `TransformerBlock.forward` (`CausalMultiHeadSelfAttention` and
+> `SwiGLU`). The breathing wedge confirms these per-block activations dominate transient memory and are the
+> tensors freed-then-replaced-by-gradients during backward.
 
 ---
 
@@ -398,8 +424,9 @@ the insight that motivates §4 FlashAttention and §6/§7 sharding).
 - [x] §2.1.4 `nsys_profile` (5 pts) — NVTX annotations, small/512 profiled, all five answers.
       (Optional: extra size/context combos for full coverage.)
 - [x] §2.1.5 `mixed_precision_accumulation` (1) + `benchmarking_mixed_precision` (2) — all answered.
-- [x] §2.1.6 `memory_profiling` (4 pts) — code added, medium/batch-1 profiled (xl/large OOM on 32 GB,
-      documented), (b)/(c)/(d) answered. TODO: capture the two memory_viz timeline screenshots for (a)/(e).
+- [x] §2.1.6 `memory_profiling` (4 pts) — code added; profiled (xl/large OOM on 32 GB, documented);
+      (a)/(b)/(c)/(d)/(e) answered with memory_viz screenshots in `Artifacts/`. TODO: part (f) nsys
+      per-block residual analysis.
 - [ ] §4 FlashAttention-2 (Triton) — biggest single chunk (forward 15 pts, backward 5 pts).
 - [ ] §5 DDP, §6 optimizer state sharding, §7 FSDP, §8 parallelism math, §9 leaderboard.
 
