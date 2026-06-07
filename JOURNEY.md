@@ -475,6 +475,79 @@ large: 4·1280² + 3·1280·5120 + 2·1280 = 6.55M + 19.66M + 0.003M ≈ 26.2M p
 
 ---
 
+## 8. Single-GPU memory: gradient checkpointing (§3, Problem `gradient_checkpointing`, 4 pts)
+
+**§3 in one paragraph.** Backward needs forward activations ("residuals"/"saved tensors"). Fine-grained
+ops save more than expected (RMSNorm saves ~5 tensors); **operator fusion** (`torch.compile`) collapses a
+subgraph into one op that saves only its essential input. But even fused, **one xl TransformerBlock saves
+~3.6 GiB** of residuals at B=4/T=2048 → ×32 layers = **114 GiB**, growing linearly with batch, seq, d_model.
+**Activation checkpointing** (`torch.utils.checkpoint.checkpoint`) fixes this by saving only a region's
+*input* in forward, dropping its internal residuals, and **recomputing** the forward during backward — trading
+compute for memory. Peak = (boundary inputs stored) + (residuals materialized while recomputing one region);
+**nesting** checkpoints drives memory lower still.
+
+**Code:** added `--gradient-checkpointing` / `--checkpoint-segment k` to `benchmark.py`. It replaces
+`model.layers` with `_CheckpointedSegment` wrappers of `k` consecutive blocks each (k=1 → checkpoint every
+block), reparenting the same blocks so params/optimizer are unchanged.
+
+### (a) Memory-optimal strategy (nesting allowed, ignore compute)
+
+**Recursive (nested) binary checkpointing:** split the N blocks in half, wrap each half in `checkpoint`, and
+recurse down to a single block. During backward only the root→leaf recursion path is live (**O(log N)**
+boundary activations) plus the **one** block being recomputed at the deepest level.
+
+- **Peak activation memory: O(log N)** — one block's residuals materialized at a time, on top of the log N
+  boundary inputs along the active path.
+- **Compute: O(N log N)** — each block is recomputed once per recursion level above it (tree depth log N).
+
+*(No checkpointing = O(N) mem / O(N) compute; single-level "checkpoint every block" = O(N) mem because all
+N boundary inputs are stored at once — nesting is what cuts the input-storage term to O(log N).)*
+
+```python
+from torch.utils.checkpoint import checkpoint
+def run(blocks, x):
+    if len(blocks) == 1:
+        return blocks[0](x)
+    mid = len(blocks) // 2
+    x = checkpoint(lambda y: run(blocks[:mid], y), x, use_reentrant=False)
+    x = checkpoint(lambda y: run(blocks[mid:], y), x, use_reentrant=False)
+    return x
+```
+
+### (b) Best single-level (no nesting) strategy for xl, B=4, T=2048
+
+Checkpoint every `k` blocks → peak activation ≈ `(N/k)·I + k·R`, where **I = boundary activation ≈ 80 MiB**
+(residual-stream tensor, §2.1.6d) and **R = per-block residuals ≈ 3.6 GiB**. Minimizing:
+`k* = √(N·I/R) = √(32·80/3686) ≈ 0.84 → k = 1`.
+
+> **Answer (b):** Checkpoint **every individual TransformerBlock** (segment size 1). Because a block's
+> residuals (~3.6 GiB) dwarf the boundary activation (~80 MiB) by ~46×, the finest granularity wins — keep
+> only one block's residuals live at a time, and the N small boundary inputs (≈ N×80 MiB ≈ 2.5 GiB) are cheap
+> by comparison. Predicted peak activations ≈ 2.5 GiB (inputs) + 3.6 GiB (one block) ≈ ~6 GiB, vs ~8.5 GiB at
+> k=2 and ~15 GiB at k=4 — so block size 1 is best. (The textbook √N≈6 rule assumes boundary≈segment-residual
+> size; here they differ 46×, shifting the optimum to k=1.)
+
+**Empirical validation** (run on `large`, B=1, T=2048 — xl's ~54 GiB optimizer state won't fit on the 32 GB
+5090 even checkpointed, since checkpointing only shrinks *activations*):
+
+| Checkpointing | peak_memory | step time |
+|---------------|-------------|-----------|
+| off           | _TODO_      | _TODO_    |
+| segment 1     | _TODO_ (expected lowest) | ~+33% (extra forward) |
+| segment 2     | _TODO_      | _TODO_    |
+| segment 4     | _TODO_ (expected highest) | _TODO_ |
+
+```bash
+M=large
+uv run python -m cs336_systems.benchmark --size $M --context-length 2048 --mode full --batch-size 1 --warmup 2 --steps 3
+for seg in 1 2 4; do
+  uv run python -m cs336_systems.benchmark --size $M --context-length 2048 --mode full --batch-size 1 \
+    --warmup 2 --steps 3 --gradient-checkpointing --checkpoint-segment $seg
+done
+```
+
+---
+
 ## Status / next steps
 
 - [x] §2.1.3 `benchmarking_script` (4 pts) — script + (b)/(c) answers.
@@ -484,6 +557,8 @@ large: 4·1280² + 3·1280·5120 + 2·1280 = 6.55M + 19.66M + 0.003M ≈ 26.2M p
 - [x] §2.1.6 `memory_profiling` (4 pts) — code added; profiled (xl/large OOM on 32 GB, documented);
       (a)–(f) answered, memory_viz screenshots in `Artifacts/`. (f) derived; nsys memory run optional to
       confirm exact %.
+- [x] §3 `gradient_checkpointing` (4 pts) — `--gradient-checkpointing` flag added; (a) recursive O(log N)
+      and (b) checkpoint-every-block answered. TODO: run `large` k=1/2/4 to fill the measured peak table.
 - [ ] §4 FlashAttention-2 (Triton) — biggest single chunk (forward 15 pts, backward 5 pts).
 - [ ] §5 DDP, §6 optimizer state sharding, §7 FSDP, §8 parallelism math, §9 leaderboard.
 
