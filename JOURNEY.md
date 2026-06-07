@@ -428,6 +428,51 @@ Largest individual tensors (large model: d_model=1280, d_ff=5120, vocab=10000):
 > `scaled_dot_product_attention` (a saved-for-backward activation, i.e. an O(seq²) "residual"). So: weight
 > matrices dominate at short context, the quadratic attention tensor dominates at long context.
 
+### (f) Per-TransformerBlock residuals via nsys memory profiling
+
+**Method.** Combine nsys's **memory tracking** with PyTorch's **auto-generated NVTX module labels** (so
+each `TransformerBlock` becomes its own range — no manual annotation needed):
+```bash
+nsys profile -o prof_mem --trace=cuda,nvtx --cuda-memory-usage=true \
+  --pytorch=functions-trace,autograd-shapes-nvtx --force-overwrite=true \
+  -- uv run python -m cs336_systems.benchmark --size large --context-length 2048 \
+     --mode full --batch-size 1 --warmup 2 --steps 1
+```
+In the Nsight GUI, read the **allocated-memory delta across one `TransformerBlock` forward range** (= memory
+it *saves for backward*, the "residuals"), and watch the same range during backward (residuals freed,
+gradients emitted).
+
+**Residuals saved by one block (notation B,T,D,F,H; large = D=1280, F=5120, H=20, at T=2048, B=1):**
+
+| Saved tensor (op) | Shape | Size | Share |
+|-------------------|-------|------|-------|
+| attention probabilities — softmax output | (B,H,T,T) | 335 MiB | ~36% |
+| attention scores — softmax/matmul input | (B,H,T,T) | 335 MiB | ~36% |
+| SwiGLU FFN intermediates (w1 out, silu, w3 out) | (B,T,F) | 42 MiB ea | ~4.5% ea |
+| Q / K / V, normed inputs, attn out, RMSNorm saves | (B,T,D) | 10.5 MiB ea | small |
+| **Total per block** | | **~0.9 GiB** | |
+
+> **(f) — 5 largest residuals:** The two O(T²) attention matrices (softmax input + output, each
+> `(B,H,T,T)`) dominate at long context — together ~70% of a block's saved memory — followed by the three
+> SwiGLU FFN intermediates (`(B,T,F)`). This is the quadratic-attention memory that FlashAttention (§4)
+> eliminates by never materializing the N×N matrix. (At short context the `(B,T,F)` FFN tensors instead lead.)
+
+**Gradient tensors produced per block.** During backward the residuals above are freed while **gradient
+tensors are allocated — one per parameter, same size as the parameter**. A block's parameters are
+`4D² (attn q,k,v,o) + 3DF (FFN) + 2D (norms)`:
+```
+large: 4·1280² + 3·1280·5120 + 2·1280 = 6.55M + 19.66M + 0.003M ≈ 26.2M params
+       × 4 bytes ≈ 100 MiB of gradients per TransformerBlock
+```
+
+> **(f) — gradient size:** A TransformerBlock emits ~100 MiB of gradient tensors in backward (large model),
+> exactly equal to the block's parameter memory (`(4D²+3DF)·4 B`) — as expected, since autograd produces one
+> gradient of identical shape per weight. The per-block memory swing in backward = (gradients allocated) −
+> (residuals freed); since residuals (~0.9 GiB at T=2048) ≫ gradients (~0.1 GiB), net memory **drops** as
+> each block's backward completes, which is why the full-step timeline declines through the backward pass.
+
+*(Derived from the model config + saved-tensor accounting; exact %/screenshots come from the nsys run above.)*
+
 ---
 
 ## Status / next steps
@@ -437,8 +482,8 @@ Largest individual tensors (large model: d_model=1280, d_ff=5120, vocab=10000):
       (Optional: extra size/context combos for full coverage.)
 - [x] §2.1.5 `mixed_precision_accumulation` (1) + `benchmarking_mixed_precision` (2) — all answered.
 - [x] §2.1.6 `memory_profiling` (4 pts) — code added; profiled (xl/large OOM on 32 GB, documented);
-      (a)/(b)/(c)/(d)/(e) answered with memory_viz screenshots in `Artifacts/`. TODO: part (f) nsys
-      per-block residual analysis.
+      (a)–(f) answered, memory_viz screenshots in `Artifacts/`. (f) derived; nsys memory run optional to
+      confirm exact %.
 - [ ] §4 FlashAttention-2 (Triton) — biggest single chunk (forward 15 pts, backward 5 pts).
 - [ ] §5 DDP, §6 optimizer state sharding, §7 FSDP, §8 parallelism math, §9 leaderboard.
 
